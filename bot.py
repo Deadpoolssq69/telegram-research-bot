@@ -270,6 +270,7 @@ async def start_next(update: Update, context: ContextTypes.DEFAULT_TYPE):
     /start or /next → assign one available log to a worker.
     """
     user_id = update.effective_user.id
+    logger.info(f"===== start_next called for user={user_id}")
     authorized, role = is_user_authorized(user_id)
     if not authorized or role != "worker":
         await update.message.reply_text("❌ You are not authorized to get a log. Ask an admin to add you.")
@@ -341,103 +342,82 @@ async def handle_reply(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
     user_id = update.effective_user.id
     text = update.message.text.strip()
-
-    # 1) Verify this is a worker with a pending assignment
-    authorized, role = is_user_authorized(user_id)
-    if not authorized or role != "worker":
-        return
-
-    if user_id not in pending_assignment:
-        # They have no “open” log. Ignore random text.
-        return
-
-    # 2) Make sure this text *contains* a number
-    m_balance = BALANCE_RE.search(text)  # BALANCE_RE = re.compile(r"[-+]?\d*\.?\d+")
-    if not m_balance:
-        await update.message.reply_text(
-            "❌ Please send a valid balance (just a number or decimal, e.g. `12` or `12.50` or `$12`)."
-        )
-        return
+    logger.info(f"===== handle_reply called: user={user_id}, text='{text}'")
 
     try:
-        balance_amount = float(m_balance.group())
-    except:
-        await update.message.reply_text("❌ Could not parse that number. Please send e.g. `12.50` or `$12`.")
-        return
+        authorized, role = is_user_authorized(user_id)
+        if not authorized or role != "worker":
+            return
 
-    # 3) Grab their pending assignment details
-    log_id, msg_to_delete, batch_id = pending_assignment[user_id]
+        if user_id not in pending_assignment:
+            return
 
-    # 4) Fetch the original log_text from unchecked_logs
-    conn = get_db_connection()
-    cur = conn.cursor()
-    cur.execute("SELECT log_text FROM unchecked_logs WHERE id = %s;", (log_id,))
-    res = cur.fetchone()
-    if not res:
-        # Already processed or expired
-        del pending_assignment[user_id]
-        await update.message.reply_text("⚠️ That log is no longer available. Trying next...")
+        m_balance = BALANCE_RE.search(text)
+        if not m_balance:
+            await update.message.reply_text(
+                "❌ Please send a valid balance (just a number or decimal, e.g. `12` or `12.50` or `$12`)."
+            )
+            return
+
+        try:
+            balance_amount = float(m_balance.group())
+        except:
+            await update.message.reply_text("❌ Could not parse that number. Please send e.g. `12.50` or `$12`.")
+            return
+
+        log_id, msg_to_delete, batch_id = pending_assignment[user_id]
+
+        conn = get_db_connection()
+        cur = conn.cursor()
+        cur.execute("SELECT log_text FROM unchecked_logs WHERE id = %s;", (log_id,))
+        res = cur.fetchone()
+        if not res:
+            del pending_assignment[user_id]
+            await update.message.reply_text("⚠️ That log is no longer available. Trying next...")
+            cur.close()
+            conn.close()
+            await start_next(update, context)
+            return
+
+        orig_text = res[0]
+
+        user_obj = await context.bot.get_chat(user_id)
+        worker_username = user_obj.username or str(user_id)
+
+        cur.execute("""
+            INSERT INTO checked_logs(
+                batch_id, orig_log_id, log_text,
+                worker_id, worker_username, result_text, checked_at
+            ) VALUES (%s,%s,%s,%s,%s,%s,NOW() AT TIME ZONE %s);
+        """, (
+            batch_id, log_id, orig_text,
+            user_id, worker_username, text, TIMEZONE
+        ))
+
+        cur.execute("DELETE FROM unchecked_logs WHERE id = %s;", (log_id,))
+        conn.commit()
+        mark_batch_finished_if_complete(batch_id)
         cur.close()
         conn.close()
+
+        del pending_assignment[user_id]
+
+        await update.message.reply_text("✅ Balance recorded! Sending your next log...")
+
+        balance_text = f"{orig_text} | balance = ${balance_amount:.2f}"
+        await context.bot.send_message(chat_id=GROUP_CHAT_ID, text=balance_text)
+
+        if balance_amount > 100:
+            celebratory = (
+                f"{HIGH_BALANCE_PING} 🎉 Whoa! This log had a HIGH balance of "
+                f"${balance_amount:.2f}! 🎉"
+            )
+            await context.bot.send_message(chat_id=GROUP_CHAT_ID, text=celebratory)
+
         await start_next(update, context)
-        return
 
-    orig_text = res[0]
-
-    # 5) Insert into checked_logs (including worker_username)
-    user_obj = await context.bot.get_chat(user_id)
-    worker_username = user_obj.username or str(user_id)
-
-    cur.execute("""
-        INSERT INTO checked_logs(
-            batch_id,
-            orig_log_id,
-            log_text,
-            worker_id,
-            worker_username,
-            result_text,
-            checked_at
-        )
-        VALUES (%s, %s, %s, %s, %s, %s, NOW() AT TIME ZONE %s);
-    """, (
-        batch_id,
-        log_id,
-        orig_text,
-        user_id,
-        worker_username,
-        text,
-        TIMEZONE
-    ))
-
-    # 6) Delete from unchecked_logs
-    cur.execute("DELETE FROM unchecked_logs WHERE id = %s;", (log_id,))
-    conn.commit()
-
-    # 7) Check if this batch is now complete
-    mark_batch_finished_if_complete(batch_id)
-
-    cur.close()
-    conn.close()
-
-    # 8) Clear the pending assignment
-    del pending_assignment[user_id]
-
-    # 9) Acknowledge and immediately send next log
-    await update.message.reply_text("✅ Balance recorded! Sending your next log...")
-
-    # 10) Post into the group chat with balance
-    balance_text = f"{orig_text} | balance = ${balance_amount:.2f}"
-    await context.bot.send_message(chat_id=GROUP_CHAT_ID, text=balance_text)
-
-    if balance_amount > 100:
-        celebratory = (
-            f"{HIGH_BALANCE_PING} 🎉 Whoa! This log had a HIGH balance of "
-            f"${balance_amount:.2f}! 🎉"
-        )
-        await context.bot.send_message(chat_id=GROUP_CHAT_ID, text=celebratory)
-
-    # 11) Immediately give the worker their next log
-    await start_next(update, context)
+    except Exception as e:
+        logger.exception(f"Exception inside handle_reply: {e}")
 
 async def add_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
@@ -461,7 +441,6 @@ async def add_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Role must be either 'worker' or 'admin'.")
         return
 
-    # Resolve username if needed
     if target.startswith("@"):
         try:
             user_obj = await context.bot.get_chat(target)
@@ -747,6 +726,7 @@ async def handle_queue_callback(update: Update, context: ContextTypes.DEFAULT_TY
     query = update.callback_query
     await query.answer()
     data = query.data
+    logger.info(f"===== handle_queue_callback called: data={data}")
 
     if data != "download_finished":
         return
@@ -773,6 +753,7 @@ async def handle_queue_callback(update: Update, context: ContextTypes.DEFAULT_TY
     tmp_dir = tempfile.mkdtemp()
     filename = "finished_batches_summary.txt"
     filepath = os.path.join(tmp_dir, filename)
+    logger.info(f"===== About to create finished summary file at {filepath}")
 
     with open(filepath, "w", encoding="utf-8") as f:
         for bid, total_lines, created_at, finished_at in finished_batches:
@@ -805,7 +786,7 @@ async def handle_queue_callback(update: Update, context: ContextTypes.DEFAULT_TY
     cur.close()
     conn.close()
 
-    # Send the file
+    logger.info(f"===== Sending finished summary file {filepath}")
     await query.message.reply_document(
         document=InputFile(filepath),
         filename=filename
