@@ -5,6 +5,7 @@ import re
 import logging
 import tempfile
 import psycopg2
+import zipfile
 from datetime import datetime, timedelta
 import pytz
 import asyncio
@@ -15,11 +16,14 @@ from telegram import (
     ReplyKeyboardMarkup,
     KeyboardButton,
     BotCommand,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
 )
 from telegram.ext import (
     ApplicationBuilder,
     CommandHandler,
     MessageHandler,
+    CallbackQueryHandler,
     ContextTypes,
     filters,
 )
@@ -36,66 +40,54 @@ logger = logging.getLogger(__name__)
 # ------------------------
 # 2) READ ENVIRONMENT VARIABLES
 # ------------------------
-# BOT_TOKEN: your Telegram Bot API token (must be set as an environment variable)
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 if not BOT_TOKEN:
     logger.error("Error: BOT_TOKEN not set. Exiting.")
     exit(1)
 
-# DATABASE_URL: Railway’s PostgreSQL URL (must be set as an environment variable)
 DATABASE_URL = os.environ.get("DATABASE_URL")
 if not DATABASE_URL:
     logger.error("Error: DATABASE_URL not set. Exiting.")
     exit(1)
+
+# Group chat ID where logs are posted
+GROUP_CHAT_ID = -4828152242
+# Username to ping if balance > 100
+HIGH_BALANCE_PING = "@manipulation"
 
 # Timezone (Asia/Kolkata)
 TIMEZONE = "Asia/Kolkata"
 tz = pytz.timezone(TIMEZONE)
 
 # ------------------------
-# 3) REGEXES FOR CLEANING
+# 3) REGEXES FOR CLEANING & BALANCE
 # ------------------------
-PHONE_RE = re.compile(r"Phone Number:\s*([0-9\-\s]+)")
-CARD_RE  = re.compile(r"Loyalty Card:\s*(\d{16})")
-DIGITS_RE = re.compile(r"[^\d]")  # strips non-digits
+PHONE_RE   = re.compile(r"Phone Number:\s*([0-9\-\s]+)")
+CARD_RE    = re.compile(r"Loyalty Card:\s*(\d{16})")
+DIGITS_RE  = re.compile(r"[^\d]")  # strips non-digits
+BALANCE_RE = re.compile(r"[-+]?\d*\.?\d+")  # match integer or decimal
 
 # ------------------------
 # 4) IN-MEMORY TRACKERS
 # ------------------------
-# pending_assignment: 
-#   telegram_id → (log_id, message_id_for_deletion, batch_id)
-pending_assignment = {}
-
-# download_prompt: 
-#   telegram_id → [list_of_matching_batch_ids]
-#   Used when /download_batch <date> yields multiple matches
-download_prompt = {}
+pending_assignment = {}      # worker_id → (log_id, message_id_to_delete, batch_id)
+download_date_prompt = {}    # admin_id → True  (waiting for text‐date)
+download_batch_prompt = {}   # admin_id → [list_of_batch_ids]
 
 # ------------------------
 # 5) DATABASE HELPERS
 # ------------------------
 
 def get_db_connection():
-    """
-    Returns a new psycopg2 connection with autocommit = True.
-    """
     conn = psycopg2.connect(DATABASE_URL)
     conn.autocommit = True
     return conn
 
 def init_db():
-    """
-    Creates all necessary tables if they don’t exist:
-      - users
-      - batches
-      - unchecked_logs
-      - checked_logs
-      - pending_deletions
-    """
     conn = get_db_connection()
     cur = conn.cursor()
 
-    # 1) users table
+    # users table
     cur.execute("""
         CREATE TABLE IF NOT EXISTS users (
             id SERIAL PRIMARY KEY,
@@ -106,8 +98,7 @@ def init_db():
         );
     """)
 
-    # 2) batches table
-    #    Each uploaded file becomes one batch
+    # batches table
     cur.execute("""
         CREATE TABLE IF NOT EXISTS batches (
             id SERIAL PRIMARY KEY,
@@ -117,8 +108,7 @@ def init_db():
         );
     """)
 
-    # 3) unchecked_logs table
-    #    Holds all raw lines from each batch that are not yet processed.
+    # unchecked_logs table
     cur.execute("""
         CREATE TABLE IF NOT EXISTS unchecked_logs (
             id SERIAL PRIMARY KEY,
@@ -130,8 +120,7 @@ def init_db():
         );
     """)
 
-    # 4) checked_logs table
-    #    Once a worker replies, we move that row here, keeping batch_id.
+    # checked_logs table
     cur.execute("""
         CREATE TABLE IF NOT EXISTS checked_logs (
             id SERIAL PRIMARY KEY,
@@ -139,13 +128,13 @@ def init_db():
             orig_log_id INTEGER REFERENCES unchecked_logs(id) ON DELETE CASCADE,
             log_text TEXT NOT NULL,
             worker_id BIGINT REFERENCES users(telegram_id),
+            worker_username TEXT,
             result_text TEXT NOT NULL,
             checked_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW()
         );
     """)
 
-    # 5) pending_deletions table
-    #    For scheduling deletion of Telegram messages after 4 hours.
+    # pending_deletions table
     cur.execute("""
         CREATE TABLE IF NOT EXISTS pending_deletions (
             id SERIAL PRIMARY KEY,
@@ -154,8 +143,6 @@ def init_db():
             delete_at TIMESTAMP WITH TIME ZONE NOT NULL
         );
     """)
-
-    # Index to speed up finding expired pending_deletions
     cur.execute("""
         CREATE INDEX IF NOT EXISTS idx_pending_deletions_delete_at
         ON pending_deletions(delete_at);
@@ -170,29 +157,22 @@ def init_db():
 
 def clean_lines(raw_lines):
     """
-    Takes a list of raw strings (lines). Returns two lists:
-      - good: cleaned lines (phone formatted, validated card)
-      - bad: lines that failed validation, with a note appended.
+    Takes raw lines → returns (good_cleaned_lines, bad_lines_with_notes).
     """
     good = []
     bad = []
-
     for ln in raw_lines:
         m_phone = PHONE_RE.search(ln)
         m_card  = CARD_RE.search(ln)
-
         if not (m_phone and m_card):
             bad.append(ln + "  <-- missing phone or card")
             continue
-
         digits = DIGITS_RE.sub("", m_phone.group(1))
         if len(digits) != 10:
             bad.append(ln + "  <-- phone not 10 digits")
             continue
-
         cleaned = PHONE_RE.sub(f"Phone Number: {digits}", ln)
         good.append(cleaned)
-
     return good, bad
 
 # ------------------------
@@ -200,17 +180,12 @@ def clean_lines(raw_lines):
 # ------------------------
 
 def is_user_authorized(telegram_id):
-    """
-    Returns (True, role) if telegram_id is in users table.
-    Otherwise returns (False, None).
-    """
     conn = get_db_connection()
     cur = conn.cursor()
     cur.execute("SELECT role FROM users WHERE telegram_id = %s;", (telegram_id,))
     res = cur.fetchone()
     cur.close()
     conn.close()
-
     if res:
         return True, res[0]
     return False, None
@@ -220,35 +195,20 @@ def is_user_authorized(telegram_id):
 # ------------------------
 
 def create_new_batch(total_lines):
-    """
-    Inserts a new row into batches with total_lines.
-    Returns the new batch_id.
-    """
     conn = get_db_connection()
     cur = conn.cursor()
-    cur.execute(
-        "INSERT INTO batches(total_lines) VALUES (%s) RETURNING id;",
-        (total_lines,)
-    )
+    cur.execute("INSERT INTO batches(total_lines) VALUES (%s) RETURNING id;", (total_lines,))
     batch_id = cur.fetchone()[0]
     cur.close()
     conn.close()
     return batch_id
 
 def mark_batch_finished_if_complete(batch_id):
-    """
-    If there are no more unchecked_logs for this batch, set finished_at = NOW().
-    """
     conn = get_db_connection()
     cur = conn.cursor()
-    # Count remaining logs in unchecked_logs for this batch
-    cur.execute(
-        "SELECT COUNT(*) FROM unchecked_logs WHERE batch_id = %s;",
-        (batch_id,)
-    )
+    cur.execute("SELECT COUNT(*) FROM unchecked_logs WHERE batch_id = %s;", (batch_id,))
     remaining = cur.fetchone()[0]
     if remaining == 0:
-        # Set finished_at only if it isn’t already set
         cur.execute("""
             UPDATE batches
             SET finished_at = NOW() AT TIME ZONE %s
@@ -263,9 +223,6 @@ def mark_batch_finished_if_complete(batch_id):
 # ------------------------
 
 def schedule_message_deletion(chat_id, message_id, delete_at):
-    """
-    Add (chat_id, message_id, delete_at) to pending_deletions.
-    """
     conn = get_db_connection()
     cur = conn.cursor()
     cur.execute("""
@@ -278,8 +235,7 @@ def schedule_message_deletion(chat_id, message_id, delete_at):
 
 async def process_pending_deletions(context: ContextTypes.DEFAULT_TYPE):
     """
-    Runs every minute: finds any pending_deletions where delete_at <= now,
-    calls bot.delete_message, then removes from table.
+    Every minute: delete any Telegram messages whose delete_at ≤ now.
     """
     now = datetime.now(tz)
     conn = get_db_connection()
@@ -295,9 +251,7 @@ async def process_pending_deletions(context: ContextTypes.DEFAULT_TYPE):
         try:
             await context.bot.delete_message(chat_id=chat_id, message_id=message_id)
         except Exception as e:
-            # Might have already been deleted or expired
             logger.warning(f"Failed to delete message {message_id} in chat {chat_id}: {e}")
-        # Remove from DB
         cur.execute("DELETE FROM pending_deletions WHERE id = %s;", (pd_id,))
     conn.commit()
     cur.close()
@@ -309,8 +263,7 @@ async def process_pending_deletions(context: ContextTypes.DEFAULT_TYPE):
 
 async def start_next(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
-    Handler for /start or /next.
-    Only for role == 'worker'. Assigns one available log across all batches.
+    /start or /next → assign one available log to a worker.
     """
     user_id = update.effective_user.id
     authorized, role = is_user_authorized(user_id)
@@ -318,14 +271,12 @@ async def start_next(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ You are not authorized to get a log. Ask an admin to add you.")
         return
 
-    # If worker already has a pending assignment, remind them:
     if user_id in pending_assignment:
         await update.message.reply_text(
             "⚠️ You already have a log assigned. Please reply with your result before requesting another."
         )
         return
 
-    # 1) Pick one available log (across all batches) that is unassigned or expired
     conn = get_db_connection()
     cur = conn.cursor()
     cur.execute(f"""
@@ -333,18 +284,15 @@ async def start_next(update: Update, context: ContextTypes.DEFAULT_TYPE):
             SELECT id, log_text, batch_id
             FROM unchecked_logs
             WHERE
-              (
-                assigned_to IS NULL
-                OR assigned_at < (NOW() AT TIME ZONE '{TIMEZONE}') - INTERVAL '30 minutes'
-              )
+              (assigned_to IS NULL
+               OR assigned_at < (NOW() AT TIME ZONE '{TIMEZONE}') - INTERVAL '30 minutes')
             ORDER BY created_at
             LIMIT 1
             FOR UPDATE SKIP LOCKED
         )
         UPDATE unchecked_logs
-        SET
-          assigned_to = %s,
-          assigned_at = NOW() AT TIME ZONE %s
+        SET assigned_to = %s,
+            assigned_at = NOW() AT TIME ZONE %s
         FROM candidate
         WHERE unchecked_logs.id = candidate.id
         RETURNING unchecked_logs.id, unchecked_logs.log_text, unchecked_logs.batch_id;
@@ -359,11 +307,10 @@ async def start_next(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     log_id, log_text, batch_id = row
-    # Send the log to the worker, and capture message_id so we can delete later
     sent_msg = await update.message.reply_text(
         f"🆕 *Batch {batch_id}* — Log ID: `{log_id}`\n\n"
         f"{log_text}\n\n"
-        "Please reply with your findings within 30 minutes.",
+        "Please reply with the balance (e.g. `12.50` or `$12`).",
         parse_mode="Markdown",
         reply_markup=ReplyKeyboardMarkup(
             [[KeyboardButton("Next log ⏭️")]],
@@ -372,31 +319,29 @@ async def start_next(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
     )
 
-    # Schedule this message for deletion in 4 hours
+    # Schedule deletion of this “assignment” message in 4 hours
     delete_at = datetime.now(tz) + timedelta(hours=4)
     schedule_message_deletion(update.effective_chat.id, sent_msg.message_id, delete_at)
 
-    # Track pending assignment
     pending_assignment[user_id] = (log_id, sent_msg.message_id, batch_id)
 
 async def handle_reply(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
-    Handles plain-text replies from a worker. If they have a pending assignment, 
-    move that row into checked_logs with their reply, then acknowledge.
-    Also updates batch finished_at if needed.
+    Handle a worker’s plain‐text reply (their “balance”).
+    Moves the log to checked_logs, posts to the group with balance, pings if >100.
     """
     user_id = update.effective_user.id
     text = update.message.text.strip()
     authorized, role = is_user_authorized(user_id)
     if not authorized or role != "worker":
-        return  # ignore
+        return
 
     if user_id not in pending_assignment:
-        return  # no pending assignment, ignore
+        return
 
     log_id, msg_to_delete, batch_id = pending_assignment[user_id]
 
-    # 1) Fetch original log_text
+    # Fetch original log_text
     conn = get_db_connection()
     cur = conn.cursor()
     cur.execute("SELECT log_text FROM unchecked_logs WHERE id = %s;", (log_id,))
@@ -413,31 +358,52 @@ async def handle_reply(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     orig_text = res[0]
 
-    # 2) Insert into checked_logs
-    cur.execute("""
-        INSERT INTO checked_logs(batch_id, orig_log_id, log_text, worker_id, result_text, checked_at)
-        VALUES (%s, %s, %s, %s, %s, NOW() AT TIME ZONE %s);
-    """, (batch_id, log_id, orig_text, user_id, text, TIMEZONE))
+    # Attempt to parse a numeric balance from the worker’s reply
+    m_balance = BALANCE_RE.search(text)
+    balance_amount = None
+    if m_balance:
+        try:
+            balance_amount = float(m_balance.group())
+        except:
+            balance_amount = None
 
-    # 3) Delete from unchecked_logs
+    # Insert into checked_logs (including worker_username)
+    user_obj = await context.bot.get_chat(user_id)
+    worker_username = user_obj.username or str(user_id)
+
+    cur.execute("""
+        INSERT INTO checked_logs(batch_id, orig_log_id, log_text, worker_id, worker_username, result_text, checked_at)
+        VALUES (%s, %s, %s, %s, %s, %s, NOW() AT TIME ZONE %s);
+    """, (batch_id, log_id, orig_text, user_id, worker_username, text, TIMEZONE))
+
+    # Delete from unchecked_logs
     cur.execute("DELETE FROM unchecked_logs WHERE id = %s;", (log_id,))
     conn.commit()
 
-    # 4) Check if this batch is now complete
+    # Mark batch finished if needed
     mark_batch_finished_if_complete(batch_id)
 
     cur.close()
     conn.close()
 
-    # Clear pending assignment (the message will be deleted by the scheduled job)
     del pending_assignment[user_id]
-
     await update.message.reply_text("✅ Got it! Your result has been saved. Thank you.")
+
+    # Now, post to the group chat with balance
+    if balance_amount is not None:
+        balance_text = f"{orig_text} | balance = ${balance_amount:.2f}"
+        await context.bot.send_message(chat_id=GROUP_CHAT_ID, text=balance_text)
+
+        if balance_amount > 100:
+            celebratory = (
+                f"{HIGH_BALANCE_PING} 🎉 Whoa! This log has a HIGH balance of ${balance_amount:.2f}! 🎉"
+            )
+            await context.bot.send_message(chat_id=GROUP_CHAT_ID, text=celebratory)
 
 async def add_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
-    /add_user <telegram_id_or_username> <worker|admin>
-    Only admins can run this. Adds or updates user role.
+    /add_user <telegram_id_or_@username> <worker|admin>
+    Only admins may run.
     """
     user_id = update.effective_user.id
     authorized, role = is_user_authorized(user_id)
@@ -456,7 +422,7 @@ async def add_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Role must be either 'worker' or 'admin'.")
         return
 
-    # Resolve @username to numeric ID, if needed
+    # Resolve username if needed
     if target.startswith("@"):
         try:
             user_obj = await context.bot.get_chat(target)
@@ -490,7 +456,7 @@ async def add_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def list_workers(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
     /list_workers
-    Only admins. Lists all users with their roles and creation times.
+    Only admins. Lists all users with roles and creation time.
     """
     user_id = update.effective_user.id
     authorized, role = is_user_authorized(user_id)
@@ -519,10 +485,7 @@ async def list_workers(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
     /stats
-    Only admins. Shows:
-      - Remaining logs (all batches combined)
-      - Checked Today / This Week / This Month (all batches)
-      - Per-user totals (all time)
+    Only admins. Shows remaining logs, checked today/week/month, per-user totals.
     """
     user_id = update.effective_user.id
     authorized, role = is_user_authorized(user_id)
@@ -561,15 +524,15 @@ async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     cur.execute(f"""
         SELECT COUNT(*) FROM checked_logs
         WHERE checked_at >= date_trunc('month', NOW() AT TIME ZONE '{TIMEZONE}')
-          AND checked_at < date_trunc('month', NOW() ATimeZone '{TIMEZONE}') + INTERVAL '1 month';
+          AND checked_at < date_trunc('month', NOW() AT TIME ZONE '{TIMEZONE}') + INTERVAL '1 month';
     """)
     checked_month = cur.fetchone()[0]
 
     # Per-user totals (all time)
     cur.execute("""
-        SELECT worker_id, COUNT(*) AS total
+        SELECT worker_username, COUNT(*) AS total
         FROM checked_logs
-        GROUP BY worker_id
+        GROUP BY worker_username
         ORDER BY total DESC;
     """)
     per_worker = cur.fetchall()
@@ -594,11 +557,7 @@ async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def batch_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
     /batch_stats <batch_id>
-    Only admins. Shows for that batch:
-      - total_lines
-      - processed vs remaining
-      - started_at, finished_at (if done)
-      - how many each user processed
+    Only admins. Shows detailed stats for that batch.
     """
     user_id = update.effective_user.id
     authorized, role = is_user_authorized(user_id)
@@ -640,17 +599,17 @@ async def batch_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if finished_at else "In Progress"
     )
 
-    # Count remaining logs in that batch
+    # Count remaining logs
     cur.execute("SELECT COUNT(*) FROM unchecked_logs WHERE batch_id = %s;", (batch_id,))
     remaining = cur.fetchone()[0]
     processed = total_lines - remaining
 
-    # Per-user count for this batch
+    # Per-worker for this batch
     cur.execute("""
-        SELECT worker_id, COUNT(*) AS cnt
+        SELECT worker_username, COUNT(*) AS cnt
         FROM checked_logs
         WHERE batch_id = %s
-        GROUP BY worker_id
+        GROUP BY worker_username
         ORDER BY cnt DESC;
     """, (batch_id,))
     per_user = cur.fetchall()
@@ -676,8 +635,7 @@ async def batch_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def queue_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
     /queue
-    Only admins. Shows a list of all batches, with real-time progress for each:
-      (processed / total) and percentage, plus “In Progress” or “Finished (date)”.
+    Only admins. Shows all batches with (processed/total, percent, status).
     """
     user_id = update.effective_user.id
     authorized, role = is_user_authorized(user_id)
@@ -688,7 +646,6 @@ async def queue_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     conn = get_db_connection()
     cur = conn.cursor()
 
-    # Fetch all batches (id, total_lines, created_at, finished_at)
     cur.execute("SELECT id, total_lines, created_at, finished_at FROM batches ORDER BY created_at;")
     batches = cur.fetchall()
 
@@ -701,7 +658,6 @@ async def queue_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = "*📋 Queue Status:*\n"
     for bid, total, created_at, finished_at in batches:
         created_local = created_at.astimezone(tz).strftime("%Y-%m-%d")
-        # Count how many processed for this batch
         cur.execute("SELECT COUNT(*) FROM checked_logs WHERE batch_id = %s;", (bid,))
         proc = cur.fetchone()[0]
         perc = (proc / total) * 100 if total else 0
@@ -715,12 +671,20 @@ async def queue_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     conn.close()
     await update.message.reply_text(msg, parse_mode="Markdown")
 
-async def download_batch(update: Update, context: ContextTypes.DEFAULT_TYPE):
+# ------------------------
+# 11) DOWNLOAD MENU HELPERS
+# ------------------------
+
+def format_date_label(dt_obj):
     """
-    /download_batch <batch_id_or_DD.MM.YY>
-    Only admins. Sends a .txt file with every checked log for that batch:
-      <log_text> | Result: <result_text> | By: <worker_id> | At: <timestamp>
-    If multiple batches match the date, ask the admin to choose one.
+    Given a datetime, return “MM-DD” (e.g. “06-02”).
+    """
+    return dt_obj.strftime("%m-%d")
+
+async def download_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    /download
+    First step: show dates or prompt for a date if >10.
     """
     user_id = update.effective_user.id
     authorized, role = is_user_authorized(user_id)
@@ -728,143 +692,266 @@ async def download_batch(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ You are not authorized to download batches.")
         return
 
-    args = context.args
-    if user_id in download_prompt and args:
-        # If we were already prompting this admin for batch choice but they typed a new argument,
-        # clear the old prompt.
-        del download_prompt[user_id]
+    conn = get_db_connection()
+    cur = conn.cursor()
+    # Fetch distinct dates (YYYY-MM-DD) from batches
+    cur.execute(f"""
+        SELECT DISTINCT DATE(created_at AT TIME ZONE %s)
+        FROM batches
+        ORDER BY 1 DESC;
+    """, (TIMEZONE,))
+    rows = cur.fetchall()
+    cur.close()
+    conn.close()
 
-    if user_id in download_prompt:
-        # The admin previously was given a list of multiple batch IDs and is now replying with one of them.
-        try:
-            chosen = int(args[0])
-        except (IndexError, ValueError):
-            await update.message.reply_text("Please reply with a valid batch number from the list.")
-            return
+    if not rows:
+        await update.message.reply_text("No batches have been created yet.")
+        return
 
-        if chosen not in download_prompt[user_id]:
-            await update.message.reply_text(
-                f"Batch `{chosen}` was not in the list. Please type one of: {download_prompt[user_id]}"
-            )
-            return
-
-        # Now fetch and send the chosen batch
-        batch_id = chosen
-        del download_prompt[user_id]  # clear the prompt state
+    dates = [r[0] for r in rows]  # list of date objects
+    if len(dates) <= 10:
+        # Show as buttons (label = “MM-DD”, data = “date|YYYY-MM-DD”)
+        buttons = []
+        for dt in dates:
+            lbl = format_date_label(dt)
+            data = f"date|{dt.strftime('%Y-%m-%d')}"
+            buttons.append(InlineKeyboardButton(lbl, callback_data=data))
+        # Arrange 2 columns per row
+        keyboard = []
+        for i in range(0, len(buttons), 2):
+            keyboard.append(buttons[i:i+2])
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        await update.message.reply_text(
+            "Select a date:",
+            reply_markup=reply_markup
+        )
     else:
-        # First step: determine if args[0] is batch_id or date
-        if len(args) != 1:
-            await update.message.reply_text("Usage: /download_batch <batch_id_or_DD.MM.YY>")
-            return
+        # Too many dates → ask admin to type it manually
+        await update.message.reply_text(
+            "There are too many dates to show. Please type the date you want (month and day only),\n"
+            "for example: `6/2`, `02.06`, or `June 2`. I will ignore the year."
+        )
+        download_date_prompt[user_id] = True
 
-        param = args[0]
+async def handle_date_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Handler for when an admin types a date manually (after /download if too many dates).
+    """
+    user_id = update.effective_user.id
+    if user_id not in download_date_prompt:
+        return  # Not waiting for date
+
+    text = update.message.text.strip()
+    # Try to parse month/day from the text
+    try:
+        # Accept formats: “MM/DD”, “DD.MM”, “MonthName D”
+        # Attempt MM/DD first
+        if "/" in text:
+            parts = text.split("/")
+            month = int(parts[0])
+            day = int(parts[1])
+        elif "." in text:
+            parts = text.split(".")
+            month = int(parts[1]) if len(parts) == 3 else int(parts[1])
+            day = int(parts[0])
+        else:
+            # Try “July 2” or “Jun 2” or “6 2”
+            parts = text.replace(",", "").split()
+            month_str = parts[0]
+            if month_str.isdigit():
+                month = int(month_str)
+            else:
+                dt = datetime.strptime(month_str, "%B")
+                month = dt.month
+            day = int(parts[1])
+        # We ignore year
+        # Build search string “YYYY-MM-DD” for any year
+        # Query for batches where month and day match
         conn = get_db_connection()
         cur = conn.cursor()
+        cur.execute("""
+            SELECT id, created_at FROM batches
+            WHERE EXTRACT(MONTH FROM created_at AT TIME ZONE %s) = %s
+              AND EXTRACT(DAY FROM created_at AT TIME ZONE %s) = %s
+            ORDER BY created_at DESC;
+        """, (TIMEZONE, month, TIMEZONE, day))
+        rows = cur.fetchall()
+        cur.close()
+        conn.close()
+        if not rows:
+            await update.message.reply_text(f"No batches found on date `{text}`.")
+            download_date_prompt.pop(user_id, None)
+            return
+        batch_ids = [r[0] for r in rows]
+        download_date_prompt.pop(user_id, None)
+        # Now show the menu of batch IDs
+        await send_batch_menu(update, context, batch_ids)
+    except Exception as e:
+        await update.message.reply_text(
+            "Could not parse that date. Please use formats like `6/2`, `02.06`, or `June 2`."
+        )
+        return
 
-        # Try interpreting param as integer batch_id
-        batch_id = None
-        try:
-            bid = int(param)
-            # Check if that batch exists
-            cur.execute("SELECT 1 FROM batches WHERE id = %s;", (bid,))
-            if cur.fetchone():
-                batch_id = bid
-            else:
-                await update.message.reply_text(f"Batch `{bid}` not found. Please try again.")
-                cur.close()
-                conn.close()
-                return
-        except ValueError:
-            # Not an integer; try parsing as date DD.MM.YY or DD.MM.YYYY
-            try:
-                parts = param.split(".")
-                if len(parts) == 3:
-                    day = int(parts[0])
-                    month = int(parts[1])
-                    year = int(parts[2])
-                    if year < 100:
-                        year += 2000
-                    dt = datetime(year, month, day, tzinfo=tz)
-                    date_str = dt.strftime("%Y-%m-%d")
-                else:
-                    raise ValueError
-            except:
-                await update.message.reply_text("Invalid format. Use batch ID or date DD.MM.YY / DD.MM.YYYY.")
-                cur.close()
-                conn.close()
-                return
+async def send_batch_menu(update: Update, context: ContextTypes.DEFAULT_TYPE, batch_ids):
+    """
+    Given a list of batch_ids, show up to 4 buttons plus “View More” if needed.
+    """
+    user_id = update.effective_user.id
+    # Store all batch_ids in prompt state
+    download_batch_prompt[user_id] = batch_ids
 
-            # Find batches created on that date
-            cur.execute("""
-                SELECT id FROM batches
-                WHERE DATE(created_at AT TIME ZONE %s) = %s::date;
-            """, (TIMEZONE, date_str))
-            rows = cur.fetchall()
-            if not rows:
-                await update.message.reply_text(f"No batch found for date `{param}`.", parse_mode="Markdown")
-                cur.close()
-                conn.close()
-                return
+    # Show first 4
+    to_show = batch_ids[:4]
+    buttons = [InlineKeyboardButton(f"Batch {bid}", callback_data=f"batch|{bid}") for bid in to_show]
+    keyboard = []
+    for i in range(0, len(buttons), 2):
+        keyboard.append(buttons[i:i+2])
 
-            batch_ids = [r[0] for r in rows]
-            if len(batch_ids) == 1:
-                batch_id = batch_ids[0]
-            else:
-                # Multiple batches on that date: ask the admin to choose
-                await update.message.reply_text(
-                    f"On `{param}` we created these batches: {batch_ids}\n"
-                    "Please reply with the batch number you wish to download."
-                )
-                # Store this list so we know what’s valid next time
-                download_prompt[user_id] = batch_ids
-                cur.close()
-                conn.close()
-                return
+    if len(batch_ids) > 4:
+        keyboard.append([InlineKeyboardButton("View More…", callback_data="view_more")])
 
+    await update.message.reply_text(
+        "Select a batch:",
+        reply_markup=InlineKeyboardMarkup(keyboard)
+    )
+
+async def handle_download_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Handles all callback_query data for /download flow:
+      - “date|YYYY-MM-DD”
+      - “batch|<id>”
+      - “view_more”
+    """
+    query = update.callback_query
+    await query.answer()
+    user_id = query.from_user.id
+    data = query.data
+
+    if data.startswith("date|"):
+        # Admin tapped a date button
+        chosen_date = data.split("|", 1)[1]  # “YYYY-MM-DD”
+        # Fetch batch IDs for that exact date
+        conn = get_db_connection()
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT id FROM batches
+            WHERE DATE(created_at AT TIME ZONE %s) = %s::date
+            ORDER BY created_at DESC;
+        """, (TIMEZONE, chosen_date))
+        rows = cur.fetchall()
         cur.close()
         conn.close()
 
-    # At this point, we have a valid batch_id to download
+        batch_ids = [r[0] for r in rows]
+        if not batch_ids:
+            await query.message.reply_text(f"No batches found on date `{chosen_date}`.")
+            return
+        # Show batch menu
+        await send_batch_menu(query, context, batch_ids)
+
+    elif data == "view_more":
+        # Show next page of batch IDs
+        all_batches = download_batch_prompt.get(user_id, [])
+        if not all_batches:
+            await query.message.reply_text("No batches pending.")
+            return
+        # Find which were shown already by looking at last text’s buttons
+        # Easiest: remove first four, then show next four
+        remaining = all_batches[4:]
+        if not remaining:
+            await query.message.reply_text("No more batches.")
+            return
+        to_show = remaining[:4]
+        buttons = [InlineKeyboardButton(f"Batch {bid}", callback_data=f"batch|{bid}") for bid in to_show]
+        keyboard = []
+        for i in range(0, len(buttons), 2):
+            keyboard.append(buttons[i:i+2])
+        if len(remaining) > 4:
+            keyboard.append([InlineKeyboardButton("View More…", callback_data="view_more")])
+
+        # Update the prompt so the next “view_more” shows further pages:
+        download_batch_prompt[user_id] = remaining
+
+        await query.message.reply_text(
+            "Select a batch:",
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
+
+    elif data.startswith("batch|"):
+        # Admin tapped a specific batch ID
+        batch_id = int(data.split("|", 1)[1])
+        # Clear any prompt state
+        download_batch_prompt.pop(user_id, None)
+        # Now send the checked‐logs .txt for batch_id
+        await send_checked_logs_file(query, context, batch_id)
+
+async def send_checked_logs_file(trigger, context, batch_id):
+    """
+    Sends a plain .txt file containing only the checked logs for that batch.
+    Each line: <log_text> | Result: <result_text> | By: <worker_username> | At: <timestamp>
+    """
     conn = get_db_connection()
     cur = conn.cursor()
     cur.execute("""
-        SELECT log_text, result_text, worker_id, checked_at
+        SELECT log_text, result_text, worker_username, checked_at
         FROM checked_logs
         WHERE batch_id = %s
         ORDER BY checked_at;
     """, (batch_id,))
     entries = cur.fetchall()
-    if not entries:
-        await update.message.reply_text(f"No checked logs found for batch `{batch_id}`.", parse_mode="Markdown")
-        cur.close()
-        conn.close()
-        return
+    cur.close()
+    conn.close()
 
-    # Write to a temp .txt file
     tmp_dir = tempfile.mkdtemp()
     filename = f"batch_{batch_id}_checked.txt"
     filepath = os.path.join(tmp_dir, filename)
-    with open(filepath, "w", encoding="utf-8") as f:
-        for log_text, result_text, worker_id, checked_at in entries:
-            ts_local = checked_at.astimezone(tz).strftime("%Y-%m-%d %H:%M:%S")
-            line = (
-                f"{log_text} | Result: {result_text} | "
-                f"By: {worker_id} | At: {ts_local}\n"
-            )
-            f.write(line)
 
-    # Send the file
-    await update.message.reply_document(
-        document=InputFile(filepath),
-        filename=filename
-    )
-    cur.close()
-    conn.close()
+    with open(filepath, "w", encoding="utf-8") as f:
+        if entries:
+            for log_text, result_text, worker_username, checked_at in entries:
+                ts_local = checked_at.astimezone(tz).strftime("%Y-%m-%d %H:%M:%S")
+                line = (
+                    f"{log_text} | Result: {result_text} | "
+                    f"By: {worker_username} | At: {ts_local}\n"
+                )
+                f.write(line)
+        else:
+            f.write("** No checked logs yet for this batch. **\n")
+
+    # If triggered by callback_query, use trigger.message.reply_document(...)
+    if isinstance(trigger, Update) and trigger.message:
+        # Called from a “/download” workflow
+        await trigger.message.reply_document(
+            document=InputFile(filepath),
+            filename=filename
+        )
+    else:
+        # Likely a CallbackQuery
+        await trigger.message.reply_document(
+            document=InputFile(filepath),
+            filename=filename
+        )
+
+# ------------------------
+# 12) FALLBACK HANDLER FOR TEXT (dates or other commands)
+# ------------------------
+
+async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Catch-all for plain‐text messages. Used when admin is in “date prompt” state.
+    """
+    user_id = update.effective_user.id
+    if user_id in download_date_prompt:
+        await handle_date_text(update, context)
+
+# ------------------------
+# 13) /cmdlist Handler
+# ------------------------
 
 async def cmdlist(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
     /cmdlist
-    Only admins. Sends a list of every admin command and what it does.
+    Only admins. Shows all admin commands and usage.
     """
     user_id = update.effective_user.id
     authorized, role = is_user_authorized(user_id)
@@ -884,26 +971,25 @@ async def cmdlist(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "    – Detailed stats for one batch: total lines, processed vs remaining, who did how many.\n\n"
         "• `/queue`\n"
         "    – Real-time progress for all batches: processed/total (percent%), in progress or finished.\n\n"
-        "• `/download_batch <batch_id|DD.MM.YY>`\n"
-        "    – Download a .txt of all checked logs in that batch. If multiple batches share the date, you’ll be prompted to pick one.\n\n"
+        "• `/download`\n"
+        "    – Start an interactive download: first pick a date, then a batch. Only checked‐logs are sent.\n\n"
         "• `/cmdlist`\n"
         "    – Show this list of admin commands.\n\n"
         "Notes:\n"
-        "- To upload a new batch, simply send a `.txt` file in this chat.\n"
-        "- Invalid lines will be returned in `invalid_lines.txt` immediately.\n"
-        "- Workers use `/next` (or tap “Next log ⏭️”) to get logs, then reply with their findings.\n"
+        "- To upload a new batch, send a `.txt` to the bot.\n"
+        "- Invalid lines are returned immediately in `invalid_lines.txt`.\n"
+        "- Workers use `/next` to get logs and reply with their balance.\n"
+        "- Logs with balance > $100 will ping @manipulation in the group.\n"
     )
     await update.message.reply_text(msg, parse_mode="Markdown")
 
+# ------------------------
+# 14) /handle_document for New Batch Upload
+# ------------------------
+
 async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
-    When an admin sends a .txt file, this runs:
-      - Download file
-      - Read lines
-      - Clean lines
-      - Create new batch
-      - Insert good lines into unchecked_logs with batch_id
-      - Write bad lines to invalid_lines.txt and send back
+    Admin uploads a `.txt` → clean, create batch, insert good lines, return invalid lines if any.
     """
     user_id = update.effective_user.id
     authorized, role = is_user_authorized(user_id)
@@ -916,23 +1002,21 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Please upload a `.txt` file.")
         return
 
-    # 1) Download file to temp
+    # Download to temp
     file = await context.bot.get_file(doc.file_id)
     tmp_dir = tempfile.mkdtemp()
     local_path = os.path.join(tmp_dir, doc.file_name)
     await file.download_to_drive(custom_path=local_path)
 
-    # 2) Read lines
+    # Read and clean lines
     with open(local_path, "r", encoding="utf-8") as f:
         raw_lines = [line.strip() for line in f if line.strip()]
-
-    # 3) Clean lines
     good, bad = clean_lines(raw_lines)
 
-    # 4) Create new batch
+    # Create new batch
     batch_id = create_new_batch(len(raw_lines))
 
-    # 5) Insert good lines into unchecked_logs with this batch_id
+    # Insert good lines into unchecked_logs
     conn = get_db_connection()
     cur = conn.cursor()
     for ln in good:
@@ -944,20 +1028,18 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     cur.close()
     conn.close()
 
-    # 6) Inform how many good vs bad
+    # Notify admin of results
     msg = (
         f"✅ Batch `{batch_id}` created with `{len(good)}` valid lines.\n"
         f"⚠️ `{len(bad)}` invalid lines."
     )
     await update.message.reply_text(msg, parse_mode="Markdown")
 
-    # 7) If there are bad lines, write to invalid_lines.txt and send back
     if bad:
         invalid_path = os.path.join(tmp_dir, "invalid_lines.txt")
         with open(invalid_path, "w", encoding="utf-8") as f_bad:
             for ln in bad:
                 f_bad.write(ln + "\n")
-
         await update.message.reply_text(
             "Bad lines detected. See `invalid_lines.txt` for details."
         )
@@ -967,19 +1049,17 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
 # ------------------------
-# 11) MAIN: SET UP BOT, HANDLERS, AND JOBS
+# 15) MAIN: BUILD APP, REGISTER HANDLERS, REGISTER COMMANDS
 # ------------------------
 
 def main():
-    # 1) Ensure tables exist
     init_db()
 
-    # 2) Build the Application
     app = ApplicationBuilder().token(BOT_TOKEN).build()
 
-    # 3) Register command handlers
     # Worker commands
     app.add_handler(CommandHandler(["start", "next"], start_next))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_reply))
 
     # Admin commands
     app.add_handler(CommandHandler("add_user", add_user))
@@ -987,19 +1067,17 @@ def main():
     app.add_handler(CommandHandler("stats", stats))
     app.add_handler(CommandHandler("batch_stats", batch_stats))
     app.add_handler(CommandHandler("queue", queue_status))
-    app.add_handler(CommandHandler("download_batch", download_batch))
-    app.add_handler(CommandHandler("cmdlist", cmdlist))
+    app.add_handler(CommandHandler("download", download_handler))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
+    app.add_handler(CallbackQueryHandler(handle_download_callback))
 
-    # File upload (admin)
+    # File upload for new batch
     app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
 
-    # Worker replies (plain text)
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_reply))
-
-    # 4) Schedule job: process_pending_deletions every minute
+    # Schedule pending deletions
     app.job_queue.run_repeating(process_pending_deletions, interval=60, first=10)
 
-    # ─── 5) REGISTER “/” COMMANDS FOR TELEGRAM MENU ───────────────────────────────
+    # Register “/” commands so Telegram shows a menu
     async def set_commands(application):
         await application.bot.set_my_commands([
             BotCommand("start",        "Get the next log (workers only)"),
@@ -1008,13 +1086,11 @@ def main():
             BotCommand("stats",        "Show overall metrics (admin only)"),
             BotCommand("batch_stats",  "Show stats for a specific batch (admin only)"),
             BotCommand("queue",        "Show real-time progress for all batches (admin only)"),
-            BotCommand("download_batch", "Download a checked batch as a .txt (admin only)"),
+            BotCommand("download",     "Download checked logs by date & batch (admin only)"),
             BotCommand("cmdlist",      "Show a list of all admin commands (admin only)")
         ])
-
     app.post_init = set_commands
 
-    # 6) Start polling
     app.run_polling()
 
 if __name__ == "__main__":
