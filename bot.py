@@ -7,12 +7,14 @@ import tempfile
 import psycopg2
 from datetime import datetime, timedelta
 import pytz
+import asyncio
 
 from telegram import (
     Update,
     InputFile,
     ReplyKeyboardMarkup,
     KeyboardButton,
+    BotCommand,
 )
 from telegram.ext import (
     ApplicationBuilder,
@@ -559,7 +561,7 @@ async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     cur.execute(f"""
         SELECT COUNT(*) FROM checked_logs
         WHERE checked_at >= date_trunc('month', NOW() AT TIME ZONE '{TIMEZONE}')
-          AND checked_at < date_trunc('month', NOW() AT TIME ZONE '{TIMEZONE}') + INTERVAL '1 month';
+          AND checked_at < date_trunc('month', NOW() ATimeZone '{TIMEZONE}') + INTERVAL '1 month';
     """)
     checked_month = cur.fetchone()[0]
 
@@ -997,7 +999,22 @@ def main():
     # 4) Schedule job: process_pending_deletions every minute
     app.job_queue.run_repeating(process_pending_deletions, interval=60, first=10)
 
-    # 5) Start polling
+    # ─── 5) REGISTER “/” COMMANDS FOR TELEGRAM MENU ───────────────────────────────
+    async def set_commands(application):
+        await application.bot.set_my_commands([
+            BotCommand("start",        "Get the next log (workers only)"),
+            BotCommand("add_user",     "Add or update a user (admin only)"),
+            BotCommand("list_workers", "List all registered users (admin only)"),
+            BotCommand("stats",        "Show overall metrics (admin only)"),
+            BotCommand("batch_stats",  "Show stats for a specific batch (admin only)"),
+            BotCommand("queue",        "Show real-time progress for all batches (admin only)"),
+            BotCommand("download_batch", "Download a checked batch as a .txt (admin only)"),
+            BotCommand("cmdlist",      "Show a list of all admin commands (admin only)")
+        ])
+
+    app.post_init = set_commands
+
+    # 6) Start polling
     app.run_polling()
 
 if __name__ == "__main__":
