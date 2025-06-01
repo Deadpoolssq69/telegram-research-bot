@@ -50,6 +50,9 @@ if not DATABASE_URL:
     logger.error("Error: DATABASE_URL not set. Exiting.")
     exit(1)
 
+# ------------------------
+# 2.1) CONSTANTS
+# ------------------------
 # Group chat ID where logs are posted
 GROUP_CHAT_ID = -4828152242
 
@@ -328,21 +331,44 @@ async def start_next(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def handle_reply(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
-    Handle a worker’s plain‐text reply (their “balance”).
-    Moves the log to checked_logs, posts to the group with balance, pings if >100.
+    When a worker sends any plain-text that looks like a numeric balance,
+    we:
+      1. Check if they have a pending assignment. If so, pull that log.
+      2. Save it into checked_logs.
+      3. Post "<orig_log> | balance = $X.XX" in the group.
+         If > 100, also fire a second celebratory ping.
+      4. Immediately give them the next log (call start_next).
     """
     user_id = update.effective_user.id
     text = update.message.text.strip()
+
+    # 1) Verify this is a worker with a pending assignment
     authorized, role = is_user_authorized(user_id)
     if not authorized or role != "worker":
         return
 
     if user_id not in pending_assignment:
+        # They have no “open” log. Ignore random text.
         return
 
+    # 2) Make sure this text *contains* a number
+    m_balance = BALANCE_RE.search(text)  # BALANCE_RE = re.compile(r"[-+]?\d*\.?\d+")
+    if not m_balance:
+        await update.message.reply_text(
+            "❌ Please send a valid balance (just a number or decimal, e.g. `12` or `12.50` or `$12`)."
+        )
+        return
+
+    try:
+        balance_amount = float(m_balance.group())
+    except:
+        await update.message.reply_text("❌ Could not parse that number. Please send e.g. `12.50` or `$12`.")
+        return
+
+    # 3) Grab their pending assignment details
     log_id, msg_to_delete, batch_id = pending_assignment[user_id]
 
-    # Fetch original log_text
+    # 4) Fetch the original log_text from unchecked_logs
     conn = get_db_connection()
     cur = conn.cursor()
     cur.execute("SELECT log_text FROM unchecked_logs WHERE id = %s;", (log_id,))
@@ -350,56 +376,68 @@ async def handle_reply(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not res:
         # Already processed or expired
         del pending_assignment[user_id]
-        await update.message.reply_text(
-            "⚠️ That log was already processed or expired. Try /next again."
-        )
+        await update.message.reply_text("⚠️ That log is no longer available. Trying next...")
         cur.close()
         conn.close()
+        await start_next(update, context)
         return
 
     orig_text = res[0]
 
-    # Attempt to parse a numeric balance from the worker’s reply
-    m_balance = BALANCE_RE.search(text)
-    balance_amount = None
-    if m_balance:
-        try:
-            balance_amount = float(m_balance.group())
-        except:
-            balance_amount = None
-
-    # Insert into checked_logs (including worker_username)
+    # 5) Insert into checked_logs (including worker_username)
     user_obj = await context.bot.get_chat(user_id)
     worker_username = user_obj.username or str(user_id)
 
     cur.execute("""
-        INSERT INTO checked_logs(batch_id, orig_log_id, log_text, worker_id, worker_username, result_text, checked_at)
+        INSERT INTO checked_logs(
+            batch_id,
+            orig_log_id,
+            log_text,
+            worker_id,
+            worker_username,
+            result_text,
+            checked_at
+        )
         VALUES (%s, %s, %s, %s, %s, %s, NOW() AT TIME ZONE %s);
-    """, (batch_id, log_id, orig_text, user_id, worker_username, text, TIMEZONE))
+    """, (
+        batch_id,
+        log_id,
+        orig_text,
+        user_id,
+        worker_username,
+        text,
+        TIMEZONE
+    ))
 
-    # Delete from unchecked_logs
+    # 6) Delete from unchecked_logs
     cur.execute("DELETE FROM unchecked_logs WHERE id = %s;", (log_id,))
     conn.commit()
 
-    # Mark batch finished if needed
+    # 7) Check if this batch is now complete
     mark_batch_finished_if_complete(batch_id)
 
     cur.close()
     conn.close()
 
+    # 8) Clear the pending assignment
     del pending_assignment[user_id]
-    await update.message.reply_text("✅ Got it! Your result has been saved. Thank you.")
 
-    # Now, post to the group chat with balance
-    if balance_amount is not None:
-        balance_text = f"{orig_text} | balance = ${balance_amount:.2f}"
-        await context.bot.send_message(chat_id=GROUP_CHAT_ID, text=balance_text)
+    # 9) Acknowledge and immediately send next log
+    await update.message.reply_text("✅ Balance recorded! Sending your next log...")
 
-        if balance_amount > 100:
-            celebratory = (
-                f"{HIGH_BALANCE_PING} 🎉 Whoa! This log has a HIGH balance of ${balance_amount:.2f}! 🎉"
-            )
-            await context.bot.send_message(chat_id=GROUP_CHAT_ID, text=celebratory)
+    # 10) Post into the group chat with balance
+    balance_text = f"{orig_text} | balance = ${balance_amount:.2f}"
+    await context.bot.send_message(chat_id=GROUP_CHAT_ID, text=balance_text)
+
+    if balance_amount > 100:
+        celebratory = (
+            f"{HIGH_BALANCE_PING} 🎉 Whoa! This log had a HIGH balance of "
+            f"${balance_amount:.2f}! 🎉"
+        )
+        await context.bot.send_message(chat_id=GROUP_CHAT_ID, text=celebratory)
+
+    # 11) Immediately give the worker their next log
+    await start_next(update, context)
 
 async def add_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
@@ -597,7 +635,7 @@ async def batch_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     percent_today = (finished_today / total_today * 100) if total_today else 0.0
 
     summary_msg = (
-        f"*Today’s Batches:* `{total_today}` total ⏳ `{in_progress_today}` in progress, "
+        f"*Today's Batches:* `{total_today}` total ⏳ `{in_progress_today}` in progress, "
         f"✓ `{finished_today}` finished\n"
         f"Overall Completion: `{percent_today:.1f}%`\n\n"
     )
