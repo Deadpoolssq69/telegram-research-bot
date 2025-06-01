@@ -55,7 +55,7 @@ if not DATABASE_URL:
 # ------------------------
 # Replace -1004828152242 below with the exact “-100…” ID your group reports
 # (use @getidsbot in the group to fetch the full “-100…” chat ID).
-GROUP_CHAT_ID = -1004828152242
+GROUP_CHAT_ID = -1002637490216
 
 # Username to ping if balance > 100
 HIGH_BALANCE_PING = "@manipulation"
