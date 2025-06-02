@@ -28,7 +28,7 @@ from telegram.ext import (
 )
 
 # ------------------------
-# 1) BASIC LOGGING
+# 1) BASIC LOGGING & DEBUGGING
 # ------------------------
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -52,8 +52,8 @@ if not DATABASE_URL:
 # ------------------------
 # 2.1) CONSTANTS
 # ------------------------
-# Group chat ID where logs are posted
-GROUP_CHAT_ID = -4828152242
+# Group chat ID where logs are posted (verify the bot is an admin in that group)
+GROUP_CHAT_ID = -1002637490216
 
 # Username to ping if balance > 100
 HIGH_BALANCE_PING = "@manipulation"
@@ -74,7 +74,6 @@ BALANCE_RE = re.compile(r"[-+]?\d*\.?\d+")  # match integer or decimal
 # 4) IN-MEMORY TRACKERS
 # ------------------------
 pending_assignment = {}      # worker_id → (log_id, message_id_to_delete, batch_id)
-
 download_date_prompt = {}    # admin_id → True
 download_batch_prompt = {}   # admin_id → [list_of_batch_ids]
 
@@ -151,7 +150,6 @@ def init_db():
         ON pending_deletions(delete_at);
     """)
 
-    conn.commit()
     cur.close()
     conn.close()
 
@@ -220,43 +218,7 @@ def mark_batch_finished_if_complete(batch_id):
     conn.close()
 
 # ------------------------
-# 9) CLEANUP FOR TIMEOUTS
-# ------------------------
-async def cleanup_timed_out_assignments(context: ContextTypes.DEFAULT_TYPE):
-    """
-    Every minute: any unchecked_logs assigned >=30m ago get cleared from DB,
-    and clear in-memory pending_assignment so worker can /start again.
-    """
-    cutoff = datetime.now(tz) - timedelta(minutes=30)
-    conn = get_db_connection()
-    cur = conn.cursor()
-
-    # Find all logs that were assigned ≥ 30m ago
-    cur.execute(f"""
-        SELECT id, assigned_to
-        FROM unchecked_logs
-        WHERE assigned_at IS NOT NULL
-          AND assigned_at < (NOW() AT TIME ZONE %s) - INTERVAL '30 minutes';
-    """, (TIMEZONE,))
-    rows = cur.fetchall()
-
-    for log_id, worker_id in rows:
-        # Unassign in the DB
-        cur.execute("""
-            UPDATE unchecked_logs
-            SET assigned_to = NULL, assigned_at = NULL
-            WHERE id = %s;
-        """, (log_id,))
-        # Also clear in‐memory pending_assignment for that worker
-        if worker_id in pending_assignment:
-            del pending_assignment[worker_id]
-
-    conn.commit()
-    cur.close()
-    conn.close()
-
-# ------------------------
-# 10) MESSAGE DELETION HELPERS
+# 9) MESSAGE DELETION HELPERS
 # ------------------------
 def schedule_message_deletion(chat_id, message_id, delete_at):
     conn = get_db_connection()
@@ -282,7 +244,8 @@ async def process_pending_deletions(context: ContextTypes.DEFAULT_TYPE):
         WHERE delete_at <= %s;
     """, (now,))
     rows = cur.fetchall()
-    for pd_id, chat_id, message_id in rows:
+    for row in rows:
+        pd_id, chat_id, message_id = row
         try:
             await context.bot.delete_message(chat_id=chat_id, message_id=message_id)
         except Exception as e:
@@ -293,7 +256,47 @@ async def process_pending_deletions(context: ContextTypes.DEFAULT_TYPE):
     conn.close()
 
 # ------------------------
-# 11) WORKER COMMAND HANDLERS
+# 10) CLEANUP TIMED‐OUT ASSIGNMENTS (30 min)
+# ------------------------
+async def cleanup_timed_out_assignments(context: ContextTypes.DEFAULT_TYPE):
+    """
+    Every minute: any unchecked_log assigned >30 minutes ago → unassign it
+    and clear pending_assignment so the worker can request a new log.
+    """
+    threshold = datetime.now(tz) - timedelta(minutes=30)
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute(f"""
+        SELECT id, assigned_to
+        FROM unchecked_logs
+        WHERE assigned_to IS NOT NULL
+          AND assigned_at < (NOW() AT TIME ZONE '{TIMEZONE}') - INTERVAL '30 minutes';
+    """)
+    rows = cur.fetchall()
+    for log_id, worker_id in rows:
+        # Unassign in DB
+        cur.execute("""
+            UPDATE unchecked_logs
+            SET assigned_to = NULL, assigned_at = NULL
+            WHERE id = %s;
+        """, (log_id,))
+        # Clear in-memory assignment
+        if worker_id in pending_assignment:
+            pending_assignment.pop(worker_id, None)
+            # Optionally, notify the worker that their assignment expired
+            try:
+                await context.bot.send_message(
+                    chat_id=worker_id,
+                    text="⚠️ Your previous log assignment timed out (30 min). You can request a new log with /start."
+                )
+            except Exception as e:
+                logger.warning(f"Could not notify worker {worker_id} about timeout: {e}")
+    conn.commit()
+    cur.close()
+    conn.close()
+
+# ------------------------
+# 11) WORKER & ADMIN COMMAND HANDLERS
 # ------------------------
 async def start_next(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
@@ -306,34 +309,12 @@ async def start_next(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ You are not authorized to get a log. Ask an admin to add you.")
         return
 
-    # If they had a log assigned ≥30m ago, cleanup just in case
-    if user_id in pending_assignment:
-        # Check DB assigned_at timestamp
-        conn = get_db_connection()
-        cur = conn.cursor()
-        cur.execute("""
-            SELECT assigned_at
-            FROM unchecked_logs
-            WHERE id = %s;
-        """, (pending_assignment[user_id][0],))
-        row = cur.fetchone()
-        cur.close()
-        conn.close()
-        if row and row[0]:
-            assigned_time = row[0]
-            # Compare in user's timezone
-            if assigned_time < (datetime.now(tz) - timedelta(minutes=30)):
-                # Already cleaned by cleanup_timed_out_assignments job; remove in‐memory
-                del pending_assignment[user_id]
-
-    # If they still have a pending assignment, politely refuse
     if user_id in pending_assignment:
         await update.message.reply_text(
             "⚠️ You already have a log assigned. Please reply with your result before requesting another."
         )
         return
 
-    # Fetch one available log (not assigned in last 30m)
     conn = get_db_connection()
     cur = conn.cursor()
     cur.execute(f"""
@@ -376,11 +357,10 @@ async def start_next(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
     )
 
-    # Schedule deletion of this “assignment” message in 30m
+    # Schedule deletion of this “assignment” message in 30 minutes
     delete_at = datetime.now(tz) + timedelta(minutes=30)
     schedule_message_deletion(update.effective_chat.id, sent_msg.message_id, delete_at)
 
-    # Track in memory: (log_id, message_id_to_delete, batch_id)
     pending_assignment[user_id] = (log_id, sent_msg.message_id, batch_id)
 
 async def handle_reply(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -390,7 +370,7 @@ async def handle_reply(update: Update, context: ContextTypes.DEFAULT_TYPE):
       1. Check if they have a pending assignment. If so, pull that log.
       2. Save it into checked_logs.
       3. Post "<orig_log> | balance = $X.XX" in the group.
-         If > 100, also fire a second celebratory ping.
+         If > 100, also ping HIGH_BALANCE_PING.
       4. Immediately give them the next log (call start_next).
     """
     user_id = update.effective_user.id
@@ -425,9 +405,9 @@ async def handle_reply(update: Update, context: ContextTypes.DEFAULT_TYPE):
         cur.execute("SELECT log_text FROM unchecked_logs WHERE id = %s;", (log_id,))
         res = cur.fetchone()
         if not res:
-            # If somehow it vanished during timeout, just clear and give next
-            del pending_assignment[user_id]
-            await update.message.reply_text("⚠️ That log is no longer available. Trying next...")
+            # Already processed or missing
+            pending_assignment.pop(user_id, None)
+            await update.message.reply_text("⚠️ That log is no longer available. Trying next…")
             cur.close()
             conn.close()
             await start_next(update, context)
@@ -435,9 +415,11 @@ async def handle_reply(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         orig_text = res[0]
 
+        # Get the worker's username
         user_obj = await context.bot.get_chat(user_id)
         worker_username = user_obj.username or str(user_id)
 
+        # Insert into checked_logs
         cur.execute("""
             INSERT INTO checked_logs(
                 batch_id, orig_log_id, log_text,
@@ -448,31 +430,33 @@ async def handle_reply(update: Update, context: ContextTypes.DEFAULT_TYPE):
             user_id, worker_username, text, TIMEZONE
         ))
 
-        # Delete from unchecked
+        # Delete from unchecked_logs
         cur.execute("DELETE FROM unchecked_logs WHERE id = %s;", (log_id,))
         conn.commit()
         mark_batch_finished_if_complete(batch_id)
         cur.close()
         conn.close()
 
-        # Remove from in‐memory
-        del pending_assignment[user_id]
+        # Clear in-memory assignment
+        pending_assignment.pop(user_id, None)
 
-        # Acknowledge to worker and immediately give next
-        await update.message.reply_text("✅ Balance recorded! Sending your next log...")
+        # Acknowledge to worker
+        await update.message.reply_text("✅ Balance recorded! Sending your next log…")
 
-        # Post to the group
-        balance_text = f"{orig_text} | balance = ${balance_amount:.2f}"
-        await context.bot.send_message(chat_id=GROUP_CHAT_ID, text=balance_text)
+        # Post to group
+        try:
+            balance_text = f"{orig_text} | balance = ${balance_amount:.2f}"
+            await context.bot.send_message(chat_id=GROUP_CHAT_ID, text=balance_text)
+            if balance_amount > 100:
+                celebratory = (
+                    f"{HIGH_BALANCE_PING} 🎉 Whoa! This log had a HIGH balance of "
+                    f"${balance_amount:.2f}! 🎉"
+                )
+                await context.bot.send_message(chat_id=GROUP_CHAT_ID, text=celebratory)
+        except Exception as e:
+            logger.error(f"Failed to post to group: {e}")
 
-        if balance_amount > 100:
-            celebratory = (
-                f"{HIGH_BALANCE_PING} 🎉 Whoa! This log had a HIGH balance of "
-                f"${balance_amount:.2f}! 🎉"
-            )
-            await context.bot.send_message(chat_id=GROUP_CHAT_ID, text=celebratory)
-
-        # Hand out the next log immediately
+        # Give next log
         await start_next(update, context)
 
     except Exception as e:
@@ -635,12 +619,12 @@ async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(msg, parse_mode="Markdown")
 
 # ------------------------
-# 13) /queue Handler
+# 13) QUEUE STATUS (NO DOWNLOAD BUTTON)
 # ------------------------
 async def queue_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
     /queue
-    Only admins. Lists all batches with progress. (No download button here.)
+    Only admins. Lists all batches with progress, no download button.
     """
     user_id = update.effective_user.id
     authorized, role = is_user_authorized(user_id)
@@ -682,16 +666,15 @@ async def queue_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ------------------------
 def format_date_label(dt_obj):
     """
-    Given a datetime.date, return “MM-DD” (e.g. “06-02”).
+    Given a date, return “MM-DD” (e.g. “06-02”).
     """
     return dt_obj.strftime("%m-%d")
 
 async def download_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
     /download
-    Only admins. 
-    1) If ≤4 distinct dates: show as buttons “MM-DD” 
-    2) If >4 distinct dates: prompt admin to type a date manually (MM/DD, DD.MM, or MonthName D).
+    Only admins. Show up to 4 most recent dates as buttons.
+    If > 4 dates, show last 4; also prompt admin to type a date manually.
     """
     user_id = update.effective_user.id
     authorized, role = is_user_authorized(user_id)
@@ -701,7 +684,7 @@ async def download_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     conn = get_db_connection()
     cur = conn.cursor()
-    # Fetch distinct creation dates (date only), newest first
+    # Fetch distinct creation dates (date part only), newest first
     cur.execute(f"""
         SELECT DISTINCT DATE(created_at AT TIME ZONE %s)
         FROM batches
@@ -717,32 +700,28 @@ async def download_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     dates = [r[0] for r in rows]  # list of date objects
 
-    # If ≤4 distinct dates, show them as buttons
-    if len(dates) <= 4:
-        buttons = []
-        for dt in dates:
-            lbl = format_date_label(dt)
-            data = f"date|{dt.strftime('%Y-%m-%d')}"
-            buttons.append(InlineKeyboardButton(lbl, callback_data=data))
-        # Arrange 2×2 grid
-        keyboard = []
-        for i in range(0, len(buttons), 2):
-            keyboard.append(buttons[i:i+2])
-        await update.message.reply_text(
-            "Select a date:",
-            reply_markup=InlineKeyboardMarkup(keyboard)
-        )
-    else:
-        # Too many dates, ask for manual input
-        await update.message.reply_text(
-            "Too many dates to show. Please type the date you want (MM/DD, DD.MM, or MonthName D).\n"
-            "Examples: `6/2`, `02.06`, `June 2`. I will ignore the year."
-        )
-        download_date_prompt[user_id] = True
+    # Show only the 4 most recent
+    to_show = dates[:4]
+    buttons = []
+    for dt in to_show:
+        lbl = format_date_label(dt)
+        data = f"date|{dt.strftime('%Y-%m-%d')}"
+        buttons.append(InlineKeyboardButton(lbl, callback_data=data))
+
+    # Arrange buttons in 2 columns
+    keyboard = []
+    for i in range(0, len(buttons), 2):
+        keyboard.append(buttons[i:i+2])
+
+    await update.message.reply_text(
+        "Select a date (or type another date in MM/DD, DD.MM, or “Month D” format):",
+        reply_markup=InlineKeyboardMarkup(keyboard)
+    )
+    download_date_prompt[user_id] = True
 
 async def handle_date_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
-    Handler for when an admin types a date manually (after /download if >4 dates).
+    Handler for when an admin types a date manually (after /download).
     """
     user_id = update.effective_user.id
     if user_id not in download_date_prompt:
@@ -783,13 +762,13 @@ async def handle_date_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         cur.close()
         conn.close()
 
-        download_date_prompt.pop(user_id, None)
-
         if not rows:
             await update.message.reply_text(f"No batches found on date `{text}`.")
+            download_date_prompt.pop(user_id, None)
             return
 
         batch_ids = [r[0] for r in rows]
+        download_date_prompt.pop(user_id, None)
         await send_batch_menu(update, context, batch_ids)
 
     except Exception:
@@ -797,24 +776,23 @@ async def handle_date_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "Could not parse that date. Please use formats like `6/2`, `02.06`, or `June 2`."
         )
 
-async def send_batch_menu(trigger, context, batch_ids):
+async def send_batch_menu(trigger, context: ContextTypes.DEFAULT_TYPE, batch_ids):
     """
-    Given a list of batch_ids, show up to 4 buttons plus “View More…” if needed.
+    Given a list of batch_ids, show up to 4 buttons for "Download Batch ⟨id⟩".
     """
-    user_id = trigger.from_user.id
+    # Store the full list so “View More” could be implemented if needed.
+    user_id = trigger.from_user.id if hasattr(trigger, "from_user") else trigger.effective_user.id
     download_batch_prompt[user_id] = batch_ids
 
+    # Show up to 4
     to_show = batch_ids[:4]
     buttons = [InlineKeyboardButton(f"Batch {bid}", callback_data=f"batch|{bid}") for bid in to_show]
     keyboard = []
     for i in range(0, len(buttons), 2):
         keyboard.append(buttons[i:i+2])
 
-    if len(batch_ids) > 4:
-        keyboard.append([InlineKeyboardButton("View More…", callback_data="view_more")])
-
     await trigger.message.reply_text(
-        "Select a batch:",
+        "Select a batch to download:",
         reply_markup=InlineKeyboardMarkup(keyboard)
     )
 
@@ -823,7 +801,6 @@ async def handle_download_callback(update: Update, context: ContextTypes.DEFAULT
     Handles callback_query data for /download flow:
       - “date|YYYY-MM-DD”
       - “batch|<id>”
-      - “view_more”
     """
     query = update.callback_query
     await query.answer()
@@ -831,6 +808,7 @@ async def handle_download_callback(update: Update, context: ContextTypes.DEFAULT
     data = query.data
 
     if data.startswith("date|"):
+        # Admin tapped a date button
         chosen_date = data.split("|", 1)[1]  # “YYYY-MM-DD”
         conn = get_db_connection()
         cur = conn.cursor()
@@ -843,58 +821,38 @@ async def handle_download_callback(update: Update, context: ContextTypes.DEFAULT
         cur.close()
         conn.close()
 
-        if not rows:
+        batch_ids = [r[0] for r in rows]
+        if not batch_ids:
             await query.message.reply_text(f"No batches found on date `{chosen_date}`.")
             return
-        batch_ids = [r[0] for r in rows]
         await send_batch_menu(query, context, batch_ids)
 
-    elif data == "view_more":
-        all_batches = download_batch_prompt.get(user_id, [])
-        if not all_batches:
-            await query.message.reply_text("No batches pending.")
-            return
-        remaining = all_batches[4:]
-        if not remaining:
-            await query.message.reply_text("No more batches.")
-            return
-        to_show = remaining[:4]
-        buttons = [InlineKeyboardButton(f"Batch {bid}", callback_data=f"batch|{bid}") for bid in to_show]
-        keyboard = []
-        for i in range(0, len(buttons), 2):
-            keyboard.append(buttons[i:i+2])
-        if len(remaining) > 4:
-            keyboard.append([InlineKeyboardButton("View More…", callback_data="view_more")])
-
-        download_batch_prompt[user_id] = remaining
-        await query.message.reply_text(
-            "Select a batch:",
-            reply_markup=InlineKeyboardMarkup(keyboard)
-        )
-
     elif data.startswith("batch|"):
+        # Admin tapped a specific batch ID
         batch_id = int(data.split("|", 1)[1])
         download_batch_prompt.pop(user_id, None)
         await send_checked_logs_file(query, context, batch_id)
 
-async def send_checked_logs_file(trigger, context, batch_id):
+async def send_checked_logs_file(trigger, context: ContextTypes.DEFAULT_TYPE, batch_id):
     """
-    Sends a plain .txt file containing ONLY the checked logs for that batch,
-    plus a summary message listing how many workers worked and their counts.
+    Sends:
+      1) A summary message: "📊 X/Y done." plus per-worker counts
+      2) A .txt file containing all the checked logs for that batch, in the format:
+         <log_text> | balance = $X.XX
     """
     conn = get_db_connection()
     cur = conn.cursor()
 
-    # Fetch all checked entries for this batch
-    cur.execute("""
-        SELECT log_text, result_text, worker_username, checked_at
-        FROM checked_logs
-        WHERE batch_id = %s
-        ORDER BY checked_at;
-    """, (batch_id,))
-    entries = cur.fetchall()
+    # Total lines in batch
+    cur.execute("SELECT total_lines FROM batches WHERE id = %s;", (batch_id,))
+    total_line_row = cur.fetchone()
+    total_lines = total_line_row[0] if total_line_row else 0
 
-    # Also fetch per-worker counts
+    # Count checked logs
+    cur.execute("SELECT COUNT(*) FROM checked_logs WHERE batch_id = %s;", (batch_id,))
+    checked_count = cur.fetchone()[0]
+
+    # Per-worker breakdown
     cur.execute("""
         SELECT worker_username, COUNT(*) AS cnt
         FROM checked_logs
@@ -903,27 +861,28 @@ async def send_checked_logs_file(trigger, context, batch_id):
         ORDER BY cnt DESC;
     """, (batch_id,))
     per_user = cur.fetchall()
+
+    # Prepare summary text
+    if checked_count == 0:
+        summary_msg = f"📊 0/{total_lines} done.\nNo workers processed lines yet."
+    else:
+        summary_msg = f"📊 {checked_count}/{total_lines} done.\n"
+        for wk, cnt in per_user:
+            summary_msg += f"{wk}: {cnt} replies\n"
+
+    await trigger.message.reply_text(summary_msg)
+
+    # Now build the .txt file
+    cur.execute("""
+        SELECT log_text, result_text, worker_username, checked_at
+        FROM checked_logs
+        WHERE batch_id = %s
+        ORDER BY checked_at;
+    """, (batch_id,))
+    entries = cur.fetchall()
     cur.close()
     conn.close()
 
-    # Build the summary text message
-    total_processed = len(entries)
-    # Get total lines for that batch
-    conn2 = get_db_connection()
-    cur2 = conn2.cursor()
-    cur2.execute("SELECT total_lines FROM batches WHERE id = %s;", (batch_id,))
-    total_lines = cur2.fetchone()[0]
-    cur2.close()
-    conn2.close()
-
-    summary_msg = f"📊 `{total_processed}`/`{total_lines}` done.\n"
-    if per_user:
-        for wk, cnt in per_user:
-            summary_msg += f"{wk}: `{cnt}` replies\n"
-    else:
-        summary_msg += "No workers processed lines yet.\n"
-
-    # Create a temp .txt file
     tmp_dir = tempfile.mkdtemp()
     filename = f"batch_{batch_id}_checked.txt"
     filepath = os.path.join(tmp_dir, filename)
@@ -931,24 +890,21 @@ async def send_checked_logs_file(trigger, context, batch_id):
     with open(filepath, "w", encoding="utf-8") as f:
         if entries:
             for log_text, result_text, worker_username, checked_at in entries:
-                ts_local = checked_at.astimezone(tz).strftime("%Y-%m-%d %H:%M:%S")
-                line = (
-                    f"{log_text} | Balance = {result_text.strip()} | "
-                    f"By: {worker_username} | At: {ts_local}\n"
-                )
-                f.write(line)
+                # Extract balance from result_text
+                m_balance = BALANCE_RE.search(result_text)
+                bal = m_balance.group() if m_balance else "0"
+                f.write(f"{log_text} | balance = ${float(bal):.2f}\n")
         else:
             f.write("** No checked logs yet for this batch. **\n")
 
-    # First send the summary message
-    await trigger.message.reply_text(summary_msg, parse_mode="Markdown")
-
-    # Now send the .txt file with a proper filename so Telegram labels it "text/plain"
-    await trigger.message.reply_document(
-        document=InputFile(filepath),
-        filename=filename,
-        # specifying filename="<whatever>.txt" forces Telegram to treat it as text/plain
-    )
+    # Send as a .txt attachment
+    try:
+        await trigger.message.reply_document(
+            document=InputFile(filepath, filename=filename),
+            filename=filename
+        )
+    except Exception as e:
+        logger.error(f"Failed to send batch file: {e}")
 
 # ------------------------
 # 15) FALLBACK HANDLER FOR TEXT (dates)
@@ -984,10 +940,9 @@ async def cmdlist(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "• `/stats`\n"
         "    – Overall summary: remaining logs, checked today/week/month, per-user totals.\n\n"
         "• `/queue`\n"
-        "    – Lists all batches with progress. (No download button here.)\n\n"
+        "    – Lists all batches with progress (no download button).\n\n"
         "• `/download`\n"
-        "    – Download only checked logs by date → batch (admin only). If ≤4 dates, shows buttons.\n"
-        "    – If >4 dates, asks you to type a date (MM/DD, DD.MM, or MonthName D).\n\n"
+        "    – Download checked logs by date → batch (admin only).\n\n"
         "• `/cmdlist`\n"
         "    – Show this list of admin commands.\n\n"
         "Notes:\n"
@@ -1057,9 +1012,8 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(
             "Bad lines detected. See `invalid_lines.txt` for details."
         )
-        # Send invalid_lines.txt with explicit filename→.txt
         await update.message.reply_document(
-            document=InputFile(invalid_path),
+            document=InputFile(invalid_path, filename="invalid_lines.txt"),
             filename="invalid_lines.txt"
         )
 
@@ -1080,21 +1034,19 @@ def main():
     app.add_handler(CommandHandler("list_workers", list_workers))
     app.add_handler(CommandHandler("stats", stats))
     app.add_handler(CommandHandler("queue", queue_status))
-
-    # /download flow
+    app.add_handler(CallbackQueryHandler(handle_download_callback, pattern="^(date\\||batch\\|)"))
     app.add_handler(CommandHandler("download", download_handler))
-    app.add_handler(CallbackQueryHandler(handle_download_callback, pattern="^(date\\||batch\\||view_more)"))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
-
     app.add_handler(CommandHandler("cmdlist", cmdlist))
 
     # File upload (new batch)
     app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
 
-    # Schedule pending deletions (every minute)
+    # Schedule jobs:
+    #  1) Pending deletions → every minute
+    #  2) Cleanup timed-out assignments → every minute
     app.job_queue.run_repeating(process_pending_deletions, interval=60, first=10)
-    # Schedule timed‐out assignment cleanup (every minute)
-    app.job_queue.run_repeating(cleanup_timed_out_assignments, interval=60, first=5)
+    app.job_queue.run_repeating(cleanup_timed_out_assignments, interval=60, first=15)
 
     # Register “/” commands so Telegram shows a menu
     async def set_commands(application):
@@ -1103,7 +1055,7 @@ def main():
             BotCommand("add_user",     "Add or update a user (admin only)"),
             BotCommand("list_workers", "List all registered users (admin only)"),
             BotCommand("stats",        "Show overall metrics (admin only)"),
-            BotCommand("queue",        "Show all batches + progress (admin only)"),
+            BotCommand("queue",        "Show all batches (admin only)"),
             BotCommand("download",     "Download checked logs by date → batch (admin only)"),
             BotCommand("cmdlist",      "Show a list of all admin commands (admin only)")
         ])
