@@ -178,7 +178,7 @@ def _write_checked_file(date_str: str, batch_num: int, checked_lines: list[str])
     return path
 
 
-async def _cleanup_timed_out_assignments(context: ContextTypes.DEFAULT_TYPE) -> None:
+def _cleanup_timed_out_assignments(context: ContextTypes.DEFAULT_TYPE) -> None:
     """
     Called every minute by job_queue. Remove any worker assignments older than
     ASSIGNMENT_TIMEOUT_MINUTES so they can request a new log after timeout.
@@ -193,6 +193,7 @@ async def _cleanup_timed_out_assignments(context: ContextTypes.DEFAULT_TYPE) -> 
     for user_id in to_remove:
         del assignments[user_id]
         logger.info(f"🕒 Assignment for user {user_id} timed out and was removed.")
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # COMMAND HANDLERS
@@ -505,7 +506,8 @@ def main() -> None:
         )
     )
 
-    # Schedule cleanup job every 60 seconds (now using async signature)
+    # Schedule cleanup job every 60 seconds
+    # Uses Application.job_queue instead of post_init
     app.job_queue.run_repeating(
         _cleanup_timed_out_assignments,
         interval=60,
