@@ -2,6 +2,7 @@
 # bot.py
 
 import os
+import json
 import logging
 import tempfile
 import datetime
@@ -34,7 +35,6 @@ if BOT_TOKEN == "YOUR_BOT_TOKEN_HERE" or not BOT_TOKEN:
     raise RuntimeError("Error: BOT_TOKEN not set. Exiting.")
 
 # 2. GROUP CHAT ID (must be a negative number for supergroups)
-#    Replace with your actual group chat ID here:
 GROUP_CHAT_ID = -1002637490216
 
 # 3. TIMEOUT FOR WORKER ASSIGNMENTS (minutes)
@@ -333,10 +333,6 @@ async def download_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     )
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# CALLBACK QUERY HANDLERS (DOWNLOAD FLOW)
-# ─────────────────────────────────────────────────────────────────────────────
-
 async def download_date_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """
     When user taps a date button: show all batch-buttons for that date.
@@ -397,7 +393,7 @@ async def download_batch_callback(update: Update, context: ContextTypes.DEFAULT_
             parts.append(f"{name}: {cnt} replies")
         summary = "\n".join(parts)
 
-    # Attempt to find a "checked" file on disk (logs/YYYY-MM-DD/checked/batch_N_checked.txt)
+    # Attempt to find a "checked" file on disk
     checked_folder = os.path.join(LOGS_ROOT, date_str, "checked")
     combined_path = os.path.join(checked_folder, f"batch_{bnum}_checked.txt")
     checked_lines = []
@@ -437,10 +433,6 @@ async def download_batch_callback(update: Update, context: ContextTypes.DEFAULT_
         pass
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# MESSAGE HANDLER: MANUAL DATE INPUT (for /download)
-# ─────────────────────────────────────────────────────────────────────────────
-
 async def manual_date_input_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """
     If user types a date (instead of tapping a button), parse it and show batch buttons.
@@ -475,9 +467,47 @@ async def manual_date_input_handler(update: Update, context: ContextTypes.DEFAUL
     )
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# MAIN FUNCTION
-# ─────────────────────────────────────────────────────────────────────────────
+async def add_user_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Admin-only command: /add_user <telegram_id> <worker|admin>
+    Adds or updates a user’s role in data/users.json.
+    """
+    if not update.effective_user:
+        return
+
+    # Load existing users from data/users.json (or start fresh if missing/corrupt)
+    users_path = os.path.join(" data", "users.json")
+    try:
+        with open(users_path, "r", encoding="utf-8") as f:
+            users = json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        users = {}
+
+    # Only an existing admin can add another user
+    requester_id = str(update.effective_user.id)
+    if requester_id not in users or users[requester_id] != "admin":
+        await update.message.reply_text("❌ You must be an admin to use /add_user.")
+        return
+
+    # Validate the arguments (we expect exactly two: <telegram_id> <worker|admin>)
+    if len(context.args) != 2:
+        await update.message.reply_text("Usage: /add_user <telegram_id> <worker|admin>")
+        return
+
+    new_user_id = context.args[0]
+    new_role = context.args[1].lower()
+    if new_role not in ("worker", "admin"):
+        await update.message.reply_text("Role must be either 'worker' or 'admin'.")
+        return
+
+    # Update the users dict and write it back to data/users.json
+    users[new_user_id] = new_role
+    os.makedirs(os.path.dirname(users_path), exist_ok=True)
+    with open(users_path, "w", encoding="utf-8") as f:
+        json.dump(users, f, indent=2)
+
+    await update.message.reply_text(f"✅ Added user {new_user_id} as {new_role}.")
+
 
 def main() -> None:
     """Run the bot."""
@@ -487,6 +517,7 @@ def main() -> None:
     app.add_handler(CommandHandler("start", start_handler))
     app.add_handler(CommandHandler("queue", queue_handler))
     app.add_handler(CommandHandler("download", download_handler))
+    app.add_handler(CommandHandler("add_user", add_user_handler))
 
     # CallbackQuery handlers for download flow
     app.add_handler(CallbackQueryHandler(download_date_callback, pattern=r"^DLDATE\|"))
@@ -507,7 +538,6 @@ def main() -> None:
     )
 
     # Schedule cleanup job every 60 seconds
-    # Uses Application.job_queue instead of post_init
     app.job_queue.run_repeating(
         _cleanup_timed_out_assignments,
         interval=60,
